@@ -5,4 +5,6 @@ edition = "2024"
 
 [dependencies]
 minifb = "0.29.0"
+rand = "0.10.3"
+rodio = "0.23.0"
 u4 = "0.1.2"

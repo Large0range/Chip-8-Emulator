@@ -1,5 +1,10 @@
 use minifb::*;
+use rodio::{DeviceSinkBuilder, Player, source::SquareWave};
 use u4::U4;
+
+const SHIFT_ORIGINAL: bool = false;
+const JUMP_ORIGINAL: bool = false;
+const STORE_LOAD_ORIGINAL: bool = false;
 
 static FONT: [u8; 80] = [
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
@@ -18,6 +23,25 @@ static FONT: [u8; 80] = [
     0xE0, 0x90, 0x90, 0x90, 0xE0, // D
     0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+];
+
+const KEYMAP: [Key; 16] = [
+    Key::X,
+    Key::Key1,
+    Key::Key2,
+    Key::Key3,
+    Key::Q,
+    Key::W,
+    Key::E,
+    Key::A,
+    Key::S,
+    Key::D,
+    Key::Z,
+    Key::C,
+    Key::Key4,
+    Key::R,
+    Key::F,
+    Key::V,
 ];
 
 static ROM: &[u8] = include_bytes!("../IBM.rom");
@@ -53,21 +77,29 @@ pub struct Cpu {
 
 pub struct Machine {
     cpu: Cpu,
+    keys: [u8; 16],
     display: [u8; 2048],
 }
 
 fn main() {
+    let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio");
+    let player = Player::connect_new(handle.mixer());
+    player.append(SquareWave::new(440.0));
+    player.set_volume(0.2);
+    player.pause();
+
     let mut machine = Machine {
         cpu: Cpu {
             bus: Bus::new(),
             stack: Vec::new(),
-            pc: 0,
+            pc: 0x200,
             index: 0,
             delay: 0,
             sound: 0,
 
             reg: [0; 16],
         },
+        keys: [0; 16],
         display: [0; 2048],
     };
 
@@ -90,8 +122,24 @@ fn main() {
     window.set_title("Chip 8 Emulator");
 
     while window.is_open() {
-        let instruction = fetch(&mut machine);
-        decode(&mut machine, instruction);
+        machine.cpu.delay -= if machine.cpu.delay > 0 { 1 } else { 0 };
+        machine.cpu.sound -= if machine.cpu.sound > 0 {
+            player.play();
+            1
+        } else {
+            player.pause();
+            0
+        };
+
+        for i in 0..16 {
+            machine.keys[i] = window.is_key_down(KEYMAP[i]) as u8;
+        }
+
+        for _ in 0..12 {
+            let instruction = fetch(&mut machine);
+            decode(&mut machine, instruction);
+        }
+
         let buffer: Vec<u32> = machine
             .display
             .iter()
@@ -120,25 +168,83 @@ fn decode(machine: &mut Machine, instruction: u16) {
     match first4 {
         U4::Dec00 => match instruction {
             0x00e0 => {
+                // clear screen
                 machine.display.fill(0);
-            } // clear screen
-            _ => {}
+            }
+            0x00ee => {
+                // return pc from stack
+                machine.cpu.pc = machine.cpu.stack.pop().unwrap();
+            }
+            _ => {
+                println!("{:04X}", instruction);
+            }
         },
         U4::Dec01 => {
-            machine.cpu.pc = instruction & 0x0FFF;
+            machine.cpu.pc = instruction & 0x0FFF; // jump
+        }
+        U4::Dec02 => {
+            machine.cpu.stack.push(machine.cpu.pc);
+            machine.cpu.pc = instruction & 0x0FFF; // jump and return
+        }
+        U4::Dec03 => {
+            if get_registervx(machine, &instruction) == instruction as u8 {
+                // skip if equal 3xnn
+                machine.cpu.pc += 2;
+            }
+        }
+        U4::Dec04 => {
+            if get_registervx(machine, &instruction) != instruction as u8 {
+                // skip if not equal 4xnn
+                machine.cpu.pc += 2;
+            }
+        }
+        U4::Dec05 => {
+            if get_registervx(machine, &instruction) == get_registervy(machine, &instruction) {
+                // skip if equal
+                machine.cpu.pc += 2;
+            }
         }
         U4::Dec06 => {
-            machine.cpu.reg[(instruction >> 8 & 0x000F) as usize] = (instruction & 0x00FF) as u8;
+            set_registervx(machine, &instruction, (instruction & 0x00FF) as u8); // set register vx
         }
         U4::Dec07 => {
-            machine.cpu.reg[(instruction >> 8 & 0x000F) as usize] += (instruction & 0x00FF) as u8;
+            let val =
+                get_registervx(machine, &instruction).wrapping_add(instruction as u8 & 0x00FF); // add value to register
+            set_registervx(machine, &instruction, val); // set value
+        }
+        U4::Dec08 => {
+            let last = instruction as u8 & 0x0F;
+            binary_operations(machine, &instruction, last);
+        }
+        U4::Dec09 => {
+            if get_registervx(machine, &instruction) != get_registervy(machine, &instruction) {
+                // skip if not equal
+                machine.cpu.pc += 2;
+            }
         }
         U4::Dec10 => {
-            machine.cpu.index = instruction & 0x0FFF;
+            machine.cpu.index = instruction & 0x0FFF; // set index register
+        }
+        U4::Dec11 => {
+            if JUMP_ORIGINAL {
+                machine.cpu.pc = (instruction & 0x0FFF) + machine.cpu.reg[0] as u16;
+            } else {
+                machine.cpu.pc =
+                    (instruction & 0x0FFF) + get_registervx(machine, &instruction) as u16;
+            }
+            machine.cpu.pc = machine.cpu.pc & 0x0fff;
+        }
+        U4::Dec12 => {
+            set_registervx(
+                machine,
+                &instruction,
+                rand::random::<u8>() & instruction as u8,
+            );
         }
         U4::Dec13 => {
-            let x = (machine.cpu.reg[(instruction >> 8 & 0x000F) as usize] & 63) as usize;
-            let y = (machine.cpu.reg[(instruction >> 4 & 0x000F) as usize] & 31) as usize;
+            // draw
+            let x = (get_registervx(machine, &instruction) & 63) as usize;
+            let y = (get_registervy(machine, &instruction) & 31) as usize;
             machine.cpu.reg[15] = 0;
 
             let n = instruction & 0x000F;
@@ -160,15 +266,162 @@ fn decode(machine: &mut Machine, instruction: u16) {
                 }
             }
         }
-        _ => {
-            print_instruction(&instruction);
+        U4::Dec14 => {
+            let vx = get_registervx(machine, &instruction);
+            let lower = instruction as u8;
+            match lower {
+                0x9e => {
+                    if machine.keys[(vx & 0xf) as usize] == 1 {
+                        machine.cpu.pc += 2;
+                    }
+                }
+                0xa1 => {
+                    if machine.keys[(vx & 0xf) as usize] != 1 {
+                        machine.cpu.pc += 2;
+                    }
+                }
+                _ => {}
+            }
+        }
+        U4::Dec15 => {
+            let lower = instruction as u8;
+            match lower {
+                0x07 => {
+                    set_registervx(machine, &instruction, machine.cpu.delay);
+                }
+                0x15 => {
+                    machine.cpu.delay = get_registervx(machine, &instruction);
+                }
+                0x18 => {
+                    machine.cpu.sound = get_registervx(machine, &instruction);
+                }
+                0x1e => {
+                    machine.cpu.index += get_registervx(machine, &instruction) as u16;
+                    if machine.cpu.index > 0x0FFF {
+                        machine.cpu.reg[15] = 1;
+                    }
+
+                    machine.cpu.index = machine.cpu.index & 0x0fff;
+                }
+                0x0a => {
+                    let mut pressed = false;
+                    for i in 0..machine.keys.len() as u8 {
+                        if machine.keys[i as usize] == 1 {
+                            set_registervx(machine, &instruction, i);
+                            pressed = true;
+                        }
+                    }
+                    if !pressed {
+                        machine.cpu.pc -= 2;
+                    }
+                }
+                0x29 => {
+                    machine.cpu.index =
+                        0x50 + (get_registervx(machine, &instruction) & 0xf) as u16 * 5;
+                }
+                0x33 => {
+                    let mut vx = get_registervx(machine, &instruction);
+                    machine.cpu.bus.write(machine.cpu.index + 2, vx % 10);
+                    vx /= 10;
+                    machine.cpu.bus.write(machine.cpu.index + 1, vx % 10);
+                    vx /= 10;
+                    machine.cpu.bus.write(machine.cpu.index + 0, vx % 10);
+                }
+                0x55 => {
+                    let vx = instruction >> 8 & 0x000F;
+                    for i in 0..=vx {
+                        machine
+                            .cpu
+                            .bus
+                            .write(machine.cpu.index + i as u16, machine.cpu.reg[i as usize]);
+                    }
+                    if STORE_LOAD_ORIGINAL {
+                        machine.cpu.index += vx as u16 + 1;
+                    }
+                }
+                0x65 => {
+                    let vx = instruction >> 8 & 0x000F;
+                    for i in 0..=vx {
+                        machine.cpu.reg[i as usize] =
+                            machine.cpu.bus.read(machine.cpu.index + i as u16);
+                    }
+                    if STORE_LOAD_ORIGINAL {
+                        machine.cpu.index += vx as u16 + 1;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
 
-pub fn print_instruction(byte: &u16) {
-    let mut buffer = [0; 16];
+pub fn get_registervx(machine: &mut Machine, instruction: &u16) -> u8 {
+    machine.cpu.reg[(instruction >> 8 & 0x000F) as usize]
+}
 
+pub fn set_registervx(machine: &mut Machine, instruction: &u16, val: u8) {
+    machine.cpu.reg[(instruction >> 8 & 0x000F) as usize] = val;
+}
+
+pub fn get_registervy(machine: &mut Machine, instruction: &u16) -> u8 {
+    machine.cpu.reg[(instruction >> 4 & 0x000F) as usize]
+}
+
+pub fn set_registervy(machine: &mut Machine, instruction: &u16, val: u8) {
+    machine.cpu.reg[(instruction >> 4 & 0x000F) as usize] = val;
+}
+
+pub fn binary_operations(machine: &mut Machine, instruction: &u16, last: u8) {
+    let mut vx = get_registervx(machine, instruction);
+    let vy = get_registervy(machine, instruction);
+    match last {
+        0 => {
+            set_registervx(machine, instruction, vx);
+        }
+
+        1 => {
+            set_registervx(machine, instruction, vx | vy);
+        }
+        2 => {
+            set_registervx(machine, instruction, vx & vy);
+        }
+        3 => {
+            set_registervx(machine, instruction, vx ^ vy);
+        }
+        4 => {
+            let (val, over) = vx.overflowing_add(vy);
+            set_registervx(machine, instruction, val);
+            machine.cpu.reg[15] = over as u8;
+        }
+        5 => {
+            let (val, over) = vx.overflowing_sub(vy);
+            set_registervx(machine, instruction, val);
+            machine.cpu.reg[15] = !over as u8;
+        }
+        6 => {
+            if SHIFT_ORIGINAL {
+                vx = get_registervy(machine, instruction);
+            }
+            set_registervx(machine, instruction, vx >> 1);
+            machine.cpu.reg[15] = vx & 1;
+        }
+        7 => {
+            let (val, over) = vy.overflowing_sub(vx);
+            set_registervx(machine, instruction, val);
+            machine.cpu.reg[15] = !over as u8;
+        }
+        14 => {
+            if SHIFT_ORIGINAL {
+                vx = get_registervy(machine, instruction);
+            }
+            set_registervx(machine, instruction, vx << 1);
+            machine.cpu.reg[15] = (vx >> 7) & 1;
+        }
+        _ => {}
+    }
+}
+
+pub fn print_instruction(byte: &u16) {
     for i in 0..16 {
         print!("{}", get_bit(byte, i));
     }
