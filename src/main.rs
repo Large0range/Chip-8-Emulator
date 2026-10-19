@@ -44,8 +44,6 @@ const KEYMAP: [Key; 16] = [
     Key::V,
 ];
 
-static ROM: &[u8] = include_bytes!("../IBM.rom");
-
 pub struct Bus {
     ram: Vec<u8>,
 }
@@ -85,8 +83,18 @@ fn main() {
     let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio");
     let player = Player::connect_new(handle.mixer());
     player.append(SquareWave::new(440.0));
-    player.set_volume(0.2);
+    player.set_volume(0.02);
     player.pause();
+
+    let path = match std::env::args().nth(1) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: chip8 <rom file>");
+            return;
+        }
+    };
+
+    let rom: Vec<u8> = std::fs::read(&path).expect("could not read ROM");
 
     let mut machine = Machine {
         cpu: Cpu {
@@ -106,8 +114,9 @@ fn main() {
     for i in 0..FONT.len() {
         machine.cpu.bus.ram[0x050 + i] = FONT[i];
     }
-    for i in 0..ROM.len() {
-        machine.cpu.bus.ram[0x200 + i] = ROM[i];
+
+    for i in 0..rom.len() {
+        machine.cpu.bus.ram[0x200 + i] = rom[i];
     }
 
     let mut window = match Window::new("Test", 640, 400, WindowOptions::default()) {
@@ -376,7 +385,7 @@ pub fn binary_operations(machine: &mut Machine, instruction: &u16, last: u8) {
     let vy = get_registervy(machine, instruction);
     match last {
         0 => {
-            set_registervx(machine, instruction, vx);
+            set_registervx(machine, instruction, vy);
         }
 
         1 => {
